@@ -1,0 +1,260 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use App\Models\Jobs;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Validator;
+
+class RecruiterController extends Controller
+{
+    /**
+     * The n8n webhook URL for job description generation.
+     *
+     * @var string
+     */
+    protected $n8nWebhookUrl = 'https://n8n.wepro.io.vn/webhook/meta-description';
+    // Hiển thị danh sách công việc
+    public function index()
+    {
+        $jobs = Jobs::where('recruiter_id', auth()->id())
+                  ->latest()
+                  ->paginate(10);
+        return view('recruiter.jobs.index', compact('jobs'));
+    }
+
+    // Trang Dashboard
+    public function dashboard()
+    {
+        $user = auth()->user();
+        $totalJobs = $user->jobs()->count();
+        $recentJobs = $user->jobs()
+                         ->latest()
+                         ->take(5)
+                         ->get();
+
+        return view('recruiter.dashboard', [
+            'totalJobs' => $totalJobs,
+            'recentJobs' => $recentJobs
+        ]);
+    }
+
+
+
+    public function createJob()
+    {
+        return view('recruiter.jobs.create');
+    }
+
+    /**
+     * Generate job description using AI
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return \Illuminate\Http\JsonResponse
+     */
+    public function generateJobDescription(Request $request)
+    {
+        // Validate request
+        $validator = Validator::make($request->all(), [
+            'job_title' => 'required|string|max:255',
+            'location' => 'required|string|max:255',
+            'experience' => 'nullable|string|max:255',
+            'work_model' => 'nullable|string|max:100',
+            'type' => 'nullable|string|max:100',
+            'minimum_salary' => 'nullable|numeric|min:0',
+            'maximum_salary' => 'nullable|numeric|min:0|gte:minimum_salary',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation error',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        try {
+            // Prepare request data
+            $requestData = [
+                'job_title' => $request->input('job_title'),
+                'location' => $request->input('location'),
+                'experience' => $request->input('experience', ''),
+                'work_model' => $request->input('work_model', ''),
+                'type' => $request->input('type', ''),
+                'minimum_salary' => $request->input('minimum_salary', 0),
+                'maximum_salary' => $request->input('maximum_salary', 0),
+            ];
+
+            // Gọi API n8n để tạo mô tả công việc
+            $data = $this->callN8NApi($requestData);
+            
+            // Trả về dữ liệu đã được định dạng
+            return response()->json([
+                'success' => true,
+                'description' => $data['description'] ?? '',
+                'objectives' => $data['objectives'] ?? [],
+                'skills' => $data['skills'] ?? [],
+                'requirements' => $data['requirements'] ?? [],
+                'benefits' => $data['benefits'] ?? []
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Error generating job description: ' . $e->getMessage());
+            
+            return response()->json([
+                'success' => false,
+                'message' => 'An error occurred while generating job description',
+                'error' => config('app.debug') ? $e->getMessage() : null
+            ], 500);
+        }
+    }
+
+    /**
+     * Store a newly created job in storage.
+     *
+     * @param  \Illuminate\Http\Request  $request
+     * @return \Illuminate\Http\Response
+     */
+    public function storeJob(Request $request)
+    {
+        $validated = $request->validate([
+            'title' => 'required|string|max:255',
+            'code' => 'nullable|string|max:50|unique:jobs,code',
+            'location' => 'required|string|max:255',
+            'content' => 'required|string',
+            'description' => 'required|string',
+            'skills' => 'required|array',
+            'objectives' => 'required|array',
+            'responsibilities' => 'required|array',
+            'minimum_salary' => 'nullable|numeric|min:0',
+            'maximum_salary' => 'nullable|numeric|min:0|gt:minimum_salary',
+            'work_model' => 'required|string|in:fulltime,parttime,remote,hybrid',
+            'experience' => 'required|string|in:intern,fresher,junior,middle,senior,manager',
+            'type' => 'required|string|in:fulltime,parttime,contract,internship,freelance'
+        ]);
+
+        // Xử lý dữ liệu trước khi lưu
+        $jobData = array_merge($validated, [
+            'recruiter_id' => Auth::id(),
+            'skills' => $validated['skills'],
+            'objectives' => $validated['objectives'],
+            'responsibilities' => $validated['responsibilities']
+        ]);
+
+        // Tạo công việc mới
+        $job = Jobs::create($jobData);
+
+        return redirect()->route('recruiter.jobs.index')
+            ->with('success', 'Đăng tin tuyển dụng thành công!');
+    }
+
+    // Base URL của API n8n
+    private $n8nBaseUrl = 'https://n8n.wepro.io.vn/webhook/description';
+    
+    /**
+     * Gửi yêu cầu đến API n8n
+     * 
+     * @param array $data
+     * @return array
+     * @throws \Exception
+     */
+    private function callN8NApi($data)
+    {
+        $response = Http::withHeaders([
+            'Content-Type' => 'application/json',
+            'Accept' => 'application/json'
+        ])
+        ->timeout(60)
+        ->post($this->n8nBaseUrl, $data);
+
+        if (!$response->successful()) {
+            throw new \Exception($response->json()['error'] ?? 'Không thể kết nối đến dịch vụ tạo mô tả');
+        }
+
+        return $response->json();
+    }
+
+    /**
+     * Tái tạo các thẻ (skills, requirements, benefits)
+     */
+    public function regenerateTag(Request $request, $tagType)
+    {
+        $validTypes = ['skills', 'requirements', 'benefits'];
+        
+        if (!in_array($tagType, $validTypes)) {
+            return response()->json([
+                'error' => 'Loại thẻ không hợp lệ'
+            ], 400);
+        }
+
+        try {
+            $response = Http::withHeaders([
+                'Content-Type' => 'application/json',
+                'Accept' => 'application/json'
+            ])->post('https://n8n.wepro.io.vn/webhook/' . $tagType . '-regenerate', [
+                'title' => $request->input('title'),
+                'description' => $request->input('description')
+            ]);
+
+            $data = $response->json();
+            
+            // Nếu có lỗi từ API
+            if (isset($data['error'])) {
+                throw new \Exception($data['error']);
+            }
+
+            return response()->json([
+                $tagType => $data[$tagType] ?? []
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error("Error regenerating tag {$tagType}: " . $e->getMessage());
+            return response()->json(['error' => "Không thể tạo lại thông tin {$tagType}"], 500);
+        }
+    }
+
+    /**
+     * Lấy thông tin meta cho công việc
+     */
+    public function fetchJobMeta(Request $request)
+    {
+        try {
+            $response = Http::withHeaders([
+                'Content-Type' => 'application/json',
+                'Accept' => 'application/json'
+            ])->post('https://n8n.wepro.io.vn/webhook/job-meta', $request->all());
+
+            return response()->json($response->json());
+
+        } catch (\Exception $e) {
+            Log::error('Error fetching job meta: ' . $e->getMessage());
+            return response()->json(['error' => 'Không thể lấy thông tin công việc'], 500);
+        }
+    }
+
+    public function suggestSkills(Request $request)
+    {
+        $request->validate([
+            'job_description' => 'required|string'
+        ]);
+
+        try {
+            $response = Http::withHeaders([
+                'Content-Type' => 'application/json',
+                'Accept' => 'application/json'
+            ])->post('https://n8n.wepro.io.vn/webhook/description', [
+                'job_description' => $request->job_description
+            ]);
+
+            return response()->json($response->json());
+        } catch (\Exception $e) {
+            Log::error('Error suggesting skills: ' . $e->getMessage());
+            return response()->json([
+                'error' => 'Hiện không thể gợi ý kỹ năng. Vui lòng thử lại sau.'
+            ], 500);
+        }
+    }
+}
